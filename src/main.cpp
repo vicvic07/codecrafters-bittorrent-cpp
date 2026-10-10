@@ -7,6 +7,10 @@
 #include "lib/nlohmann/json.hpp"
 
 using json = nlohmann::json;
+json decodeBencodedList (std::string encoded_value, int &pos);
+json decodeBencodedDictionary (std::string encoded_value, int &pos);
+json decodeBencodedInteger (std::string encoded_value, int &pos);
+json decodeBencodedString (std::string encoded_value, int &pos);
 std::string getNextWord (std::string input, int &pos, const char* ch)
 {
     std::string ret="";
@@ -34,6 +38,30 @@ json decodeBencodedString (std::string encoded_value, int &pos)
         nxt+=encoded_value[pos++];
     return json(nxt);
 }
+json decodeBencodedDictionary (std::string encoded_value, int &pos)
+{
+    json ret=json::object();
+    ++pos;
+    while (pos<encoded_value.size() && encoded_value[pos]!='e')
+    {
+        json pair[2];
+        for (int i=0;i<=1;i++)
+        {
+            if (encoded_value[pos]=='i')
+                pair[i]=decodeBencodedInteger(encoded_value, pos);
+            else if (isdigit(encoded_value[pos]))
+                pair[i]=decodeBencodedString(encoded_value, pos);
+            else if (encoded_value[pos]=='l')
+                pair[i]=decodeBencodedList(encoded_value, pos);
+            else if (encoded_value[pos]=='d')
+                pair[i]=decodeBencodedDictionary(encoded_value, pos);
+        }
+        std::cerr << pair[0] << " " << pair[1] << "\n";
+        ret[pair[0]]=pair[1];
+    }
+    ++pos;
+    return ret;
+}
 json decodeBencodedList (std::string encoded_value, int &pos)
 {
     json ret=json::array();
@@ -42,10 +70,12 @@ json decodeBencodedList (std::string encoded_value, int &pos)
     {
         if (encoded_value[pos]=='i')
             ret.push_back(decodeBencodedInteger(encoded_value, pos));
-        if (isdigit(encoded_value[pos]))
+        else if (isdigit(encoded_value[pos]))
             ret.push_back(decodeBencodedString(encoded_value, pos));
-        if (encoded_value[pos]=='l')
+        else if (encoded_value[pos]=='l')
             ret.push_back(decodeBencodedList(encoded_value, pos));
+        else if (encoded_value[pos]=='d')
+            ret.push_back(decodeBencodedDictionary(encoded_value, pos));
     }
     ++pos;
     return ret;
@@ -62,6 +92,8 @@ json decodeAll (std::string encoded_value)
             ret=decodeBencodedString(encoded_value, pos);
         if (encoded_value[pos]=='i')
             ret=decodeBencodedInteger(encoded_value, pos);
+        if (encoded_value[pos]=='d')
+            ret=decodeBencodedDictionary(encoded_value, pos);
     }
     return ret;
 }
