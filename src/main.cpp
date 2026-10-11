@@ -56,7 +56,6 @@ json decodeBencodedDictionary (std::string encoded_value, int &pos)
             else if (encoded_value[pos]=='d')
                 pair[i]=decodeBencodedDictionary(encoded_value, pos);
         }
-        std::cerr << pair[0] << " " << pair[1] << "\n";
         ret[pair[0]]=pair[1];
     }
     ++pos;
@@ -120,7 +119,27 @@ int main(int argc, char* argv[]) {
         std::string encoded_value = argv[2];
         json decoded_value = decodeAll(encoded_value);
         std::cout << decoded_value.dump() << std::endl;
-    } else {
+    }
+    else if (command == "info")
+    {
+        FILE *f;
+        if (f=fopen (argv[2], "r"))
+        {
+            char buff[4096];
+            ssize_t n;
+            std::string input="";
+            while ((n=fread(buff, sizeof(char), 4096, f)) > 0)
+            {
+                for (int i=0;i<n;i++)
+                    input.append(1, buff[i]);
+            }
+            json decoded_value = decodeAll(input);
+            std::cout << "Tracker URL: " << decoded_value["announce"].dump().substr(1, (int)decoded_value["announce"].dump().size() - 2) << "\nLength: " << decoded_value["info"]["length"].dump();
+        }
+        else
+            std::cerr << "Can't open info file\n";
+    }
+    else {
         std::cerr << "unknown command: " << command << std::endl;
         return 1;
     }
