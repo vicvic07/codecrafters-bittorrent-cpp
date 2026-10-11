@@ -3,7 +3,7 @@
 #include <vector>
 #include <cctype>
 #include <cstdlib>
-
+#include <openssl/sha.h>
 #include "lib/nlohmann/json.hpp"
 
 using json = nlohmann::json;
@@ -133,8 +133,27 @@ int main(int argc, char* argv[]) {
                 for (int i=0;i<n;i++)
                     input.append(1, buff[i]);
             }
+            /// i will avoid bencoding the info dict again and instead i will just search its encoding in the input string
+            int pos=0;
+            for (int i=0;i<input.size()-3;i++)
+            {
+                if (input.substr(i, 4)=="info")
+                {
+                    pos=i+4;
+                    break;
+                }
+            }
+            std::string to_hash = input.substr(pos, (int)input.size()-1-pos);
             json decoded_value = decodeAll(input);
-            std::cout << "Tracker URL: " << decoded_value["announce"].dump().substr(1, (int)decoded_value["announce"].dump().size() - 2) << "\nLength: " << decoded_value["info"]["length"].dump();
+            std::cout << "Tracker URL: " << decoded_value["announce"].dump().substr(1, (int)decoded_value["announce"].dump().size() - 2) << "\nLength: " << decoded_value["info"]["length"].dump() << "\n";
+            unsigned char hash[SHA_DIGEST_LENGTH]="";
+            std::cout << input << "\n";
+            std::cout << to_hash << "\n";
+            SHA1(reinterpret_cast<const unsigned char*>(to_hash.c_str()), sizeof(to_hash.size()), hash);
+            std::stringstream oss;
+            for (auto& c : hash)
+                oss << std::setw(2) << std::setfill('0') << std::hex << (int)c;
+            std::cout << "Info Hash: " << oss.str() << "\n";
         }
         else
             std::cerr << "Can't open info file\n";
