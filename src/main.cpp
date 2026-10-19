@@ -149,7 +149,7 @@ int main(int argc, char* argv[]) {
             unsigned char hash[SHA_DIGEST_LENGTH]="";
             std::cout << input << "\n";
             std::cout << to_hash << "\n";
-            SHA1(reinterpret_cast<const unsigned char*>(to_hash.c_str()), sizeof(to_hash.size()), hash);
+            SHA1(reinterpret_cast<const unsigned char*>(to_hash.data()), to_hash.size(), hash);
             std::stringstream oss;
             for (auto& c : hash)
                 oss << std::setw(2) << std::setfill('0') << std::hex << (int)c;
