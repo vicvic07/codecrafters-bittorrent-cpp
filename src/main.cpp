@@ -147,13 +147,15 @@ int main(int argc, char* argv[]) {
             json decoded_value = decodeAll(input);
             std::cout << "Tracker URL: " << decoded_value["announce"].dump().substr(1, (int)decoded_value["announce"].dump().size() - 2) << "\nLength: " << decoded_value["info"]["length"].dump() << "\n";
             unsigned char hash[SHA_DIGEST_LENGTH]="";
-            std::cout << input << "\n";
-            std::cout << to_hash << "\n";
             SHA1(reinterpret_cast<const unsigned char*>(to_hash.data()), to_hash.size(), hash);
             std::stringstream oss;
             for (auto& c : hash)
                 oss << std::setw(2) << std::setfill('0') << std::hex << (int)c;
-            std::cout << "Info Hash: " << oss.str() << "\n";
+            oss.clear();
+            std::cout << "Info Hash: " << oss.str() << "\nPiece Length: " << decoded_value["info"]["piece length"].dump() << "\nPieces: ";
+            for (const unsigned char &c : decoded_value["info"]["pieces"].get<std::string>())
+                oss << std::setw(2) << std::setfill('0') << std::hex << (int)c;
+            std::cout << oss.str() << "\n";
         }
         else
             std::cerr << "Can't open info file\n";
