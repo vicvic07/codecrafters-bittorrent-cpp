@@ -208,14 +208,19 @@ int main(int argc, char* argv[]) {
             {
                 if (ssize_t n=write (tracker_fd, (header+body).c_str(), (header+body).size()))
                 {
-                    char buff[1024];
-                    ssize_t bytes=read (tracker_fd, buff, sizeof(buff));
-                    int pos=0;
+                    char buff[4096];
+                    ssize_t bytes=0;
+                    while (bytes==0 || buff[bytes-1]!='e')
+                    {
+                        bytes+=read (tracker_fd, buff, sizeof(buff));
+                    }
                     while (!(buff[pos]=='\r' && buff[pos+1]=='\n' && buff[pos+2]=='\r' && buff[pos+3]=='\n'))
                         ++pos;
                     pos+=4;
-                    std::cout << pos << " " << buff+pos << "\n";
-                    json decoded_response = decodeAll(buff+pos);
+                    std::string bytes_string="";
+                    for (;pos<bytes;pos++)
+                        bytes_string.append(1, buff[pos]);
+                    json decoded_response = decodeAll(bytes_string);
                     std::string sockets=decoded_response["peers"].get<std::string>();
                     for (int i=0;i<sockets.size();i+=6)
                     {
