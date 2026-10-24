@@ -209,11 +209,7 @@ int main(int argc, char* argv[]) {
                 if (ssize_t n=write (tracker_fd, (header+body).c_str(), (header+body).size()))
                 {
                     char buff[4096];
-                    ssize_t bytes=0;
-                    while (bytes==0 || buff[bytes-1]!='e')
-                    {
-                        bytes+=read (tracker_fd, buff, sizeof(buff));
-                    }
+                    ssize_t bytes=read (tracker_fd, buff, sizeof(buff));
                     while (!(buff[pos]=='\r' && buff[pos+1]=='\n' && buff[pos+2]=='\r' && buff[pos+3]=='\n'))
                         ++pos;
                     pos+=4;
@@ -244,6 +240,48 @@ int main(int argc, char* argv[]) {
         }
         else
             std::cerr << "Can't open info file\n";
+    }
+    else if (command == "handshake")
+    {
+
+        int pos=0;
+        std::string ip_string = getNextWord(argv[3], pos, ":");
+        int port = atoi(getNextWord(argv[3], pos, ":\r\n \t").c_str());
+        int peer_fd;
+        struct sockaddr_in peer;
+        peer_fd = socket(AF_INET, SOCK_STREAM, 0);
+        peer.sin_family = AF_INET;
+        peer.sin_port = htons(port);
+        peer.sin_addr.s_addr = inet_addr(ip_string.c_str());
+        FILE *f;
+        if (connect (peer_fd, (struct sockaddr*)&peer, sizeof(peer))>=0)
+        {
+            if (f=fopen(argv[2], "r"))
+            {
+                std::string input = extractTorrentInfo(f);
+                std::string hash_hex = getInfoHash(input);
+                std::string wr;
+                wr.append(1, 0b00010011);
+                wr.append("BitTorrent protocol");
+                wr.append(8, 0b00000000);
+                wr.append(std::string(reinterpret_cast<const char*>(info_dict_hash)));
+                for (int i=1;i<=20;i++)
+                    wr.append(1, rand()%257);
+                std::cout << wr << "\n";
+                write (peer_fd, wr.c_str(), wr.size());
+                char buff[4096];
+                ssize_t n=read(peer_fd, buff, sizeof(buff));
+                std::cout << "Peer ID: ";
+                std::stringstream oss;
+                for (int i=n-20;i<n;i++)
+                    oss << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)buff[i];
+                std::cout << oss.str() << "\n";
+            }
+            else
+                std::cerr << "Can't open info file\n";
+        }
+        else
+            std::cerr << "Can't connect to peer\n";
     }
     else {
         std::cerr << "unknown command: " << command << std::endl;
