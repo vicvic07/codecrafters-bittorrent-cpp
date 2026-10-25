@@ -23,7 +23,7 @@ json decodeBencodedInteger (std::string encoded_value, int &pos);
 json decodeBencodedString (std::string encoded_value, int &pos);
 json decoded_value;
 std::vector<std::string> pieces;
-std::queue<std::pair<std::string, int>> request_queue;
+std::vector<std::pair<std::pair<std::string, int>, int>> request_queue;
 std::mutex request_queue_mutex;
 std::vector<std::mutex> responses_mutex;
 std::vector<std::vector<std::string>> piece_scrambled_responses;
@@ -329,33 +329,22 @@ void worker (std::string socket_str, std::string path)
     msg=getPeerMessage(socket_fd);
     while (1)
     {
-        std::vector<std::pair<std::string, int>> tasks;
+        std::vector<std::pair<std::pair<std::string, int>, int>> tasks;
         {
             std::lock_guard lock(request_queue_mutex);
-            if (!request_queue.empty())
+            for (int i=0;i<5 && !request_queue.empty();i++)
             {
-                for (int i=0;i<5 && !request_queue.empty();i++)
-                {
-                    tasks.push_back(request_queue.front());
-                    request_queue.pop();
-                }
+                tasks.push_back(request_queue.back());
+                request_queue.pop_back();
             }
-            else
-                continue;
         }
         for (const auto& task : tasks)
         {
-            ssize_t n=write (socket_fd, task.first.c_str(), task.first.size());
+            ssize_t n=write (socket_fd, task.first.first.c_str(), task.first.first.size());
             std::string response = getPeerMessage(socket_fd);
-            int piece_id=0;
-            for (int i=5;i<9;i++)
             {
-                for (int j=0;j<=7;j++)
-                    piece_id |=(1 << 8*(8-i))*((1 << j) & response[i]);
-            }
-            {
-                std::lock_guard lock(responses_mutex[piece_id]);
-                piece_scrambled_responses[piece_id].push_back(response);
+                std::lock_guard lock(responses_mutex[task.second]);
+                piece_scrambled_responses[task.second].push_back(response);
             }
         }
     }
@@ -410,12 +399,20 @@ void downloadPiece (int piece_id)
             std::lock_guard lock(responses_mutex[piece_id]);
             piece_scrambled_responses[piece_id].clear();
         }
-        for (const auto& ind : req)
         {
             std::lock_guard lock(request_queue_mutex);
-            request_queue.push(ind);
+            for (const auto& ind : req)
+            {
+                request_queue.push_back({ind, piece_id});
+            }
         }
-        while (piece_scrambled_responses[piece_id].size()<req.size());
+        while (1)
+        {
+            std::lock_guard lock(request_queue_mutex);
+            if (piece_scrambled_responses[piece_id].size()==req.size())
+                break;
+        }
+        std::cout << piece_id << std::endl;
         std::lock_guard lock(responses_mutex[piece_id]);
         std::sort (piece_scrambled_responses[piece_id].begin(), piece_scrambled_responses[piece_id].end(), [&] (std::string a, std::string b)
         {
@@ -442,6 +439,14 @@ void downloadPiece (int piece_id)
         {
             pieces[piece_id]=file;
             return;
+        }
+        {
+            std::lock_guard lock(request_queue_mutex);
+            for (int i=0;i<request_queue.size();i++)
+            {
+                if (request_queue[i].second==piece_id)
+                    request_queue.erase(std::next(request_queue.begin(), i)), --i;
+            }
         }
     }
 }
@@ -516,7 +521,7 @@ int main(int argc, char* argv[]) {
             std::thread th(worker, socket, argv[4]);
             th.detach();
         }
-        std::ofstream g (argv[3]);
+        std::ofstream g (argv[3], std::ios::binary);
         int nr_pieces = (decoded_value["info"]["length"].get<int>()+decoded_value["info"]["piece length"].get<int>()-1)/decoded_value["info"]["piece length"].get<int>();
         pieces.resize(nr_pieces);
         piece_scrambled_responses.resize(nr_pieces);
@@ -525,7 +530,7 @@ int main(int argc, char* argv[]) {
         if (command == "download_piece")
         {
             downloadPiece (atoi(argv[5]));
-            g << pieces[atoi(argv[5])];
+            g.write(pieces[atoi(argv[5])].data(), pieces[atoi(argv[5])].size());
         }
         else
         {
@@ -533,12 +538,10 @@ int main(int argc, char* argv[]) {
             for (int i=0;i<nr_pieces;i++)
             {
                 std::thread req_piece (downloadPiece, i);
-                threads.push_back(std::move(req_piece));
+                req_piece.join();
             }
-            for (auto& thread : threads)
-                thread.join();
             for (int i=0;i<nr_pieces;i++)
-                g << pieces[i];
+                g.write(pieces[i].data(), pieces[i].size());
         }
     }
     else {
