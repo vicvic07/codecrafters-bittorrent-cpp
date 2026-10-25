@@ -8,6 +8,11 @@
 #include <openssl/sha.h>
 #include <unistd.h>
 #include <netdb.h>
+#include <thread>
+#include <queue>
+#include <mutex>
+#include <algorithm>
+
 #include "lib/nlohmann/json.hpp"
 
 using json = nlohmann::json;
@@ -17,6 +22,11 @@ json decodeBencodedDictionary (std::string encoded_value, int &pos);
 json decodeBencodedInteger (std::string encoded_value, int &pos);
 json decodeBencodedString (std::string encoded_value, int &pos);
 json decoded_value;
+std::vector<std::string> pieces;
+std::queue<std::pair<std::string, int>> request_queue;
+std::mutex request_queue_mutex;
+std::vector<std::mutex> responses_mutex;
+std::vector<std::vector<std::string>> piece_scrambled_responses;
 std::string getNextWord (std::string input, int &pos, const char* ch)
 {
     std::string ret="";
@@ -199,7 +209,6 @@ std::string peerList (std::string path)
                 hash.append(1, '%'), hash.append(1, hash_hex[i]), hash.append(1, hash_hex[i+1]);
             std::string header="GET "+path+"?info_hash="+hash+"&peer_id="+"67676767676767676767&port=6881&uploaded=0&downloaded=0&left="+decoded_value["info"]["length"].dump()+"&compact=1 "+"HTTP/1.1\r\nHost: "+ip_str+"\r\nUser-Agent: BitTorrent-Peer\r\nAccept: */*\r\n";
             std::string body="\r\n";
-            std::cerr << header+body << "\n";
             int pos2=0;
             if (connect (tracker_fd, (struct sockaddr*)&tracker, sizeof(tracker))>=0)
             {
@@ -246,9 +255,11 @@ std::pair <int, std::string> peerHandshake (std::string socket_str, std::string 
     int pos=0;
     std::string ip_string = getNextWord(socket_str, pos, ":");
     int port = atoi(getNextWord(socket_str, pos, ":\r\n \t").c_str());
-    int peer_fd;
+    int peer_fd=-1;
     struct sockaddr_in peer;
     peer_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (peer_fd==-1)
+        std::cerr << "Failed to create fd to peer\n";
     ret.first=peer_fd;
     peer.sin_family = AF_INET;
     peer.sin_port = htons(port);
@@ -306,7 +317,7 @@ std::string getPeerMessage (int fd)
     }
     return ret;
 }
-std::string downloadPiece (std::string socket_str, int piece_id, std::string path)
+void worker (std::string socket_str, std::string path)
 {
     auto [socket_fd, peer_id]=peerHandshake(socket_str, path);
     std::string msg=getPeerMessage(socket_fd);
@@ -316,6 +327,41 @@ std::string downloadPiece (std::string socket_str, int piece_id, std::string pat
     wr[4]=0x02;
     write (socket_fd, wr.c_str(), (unsigned int)wr.size());
     msg=getPeerMessage(socket_fd);
+    while (1)
+    {
+        std::vector<std::pair<std::string, int>> tasks;
+        {
+            std::lock_guard lock(request_queue_mutex);
+            if (!request_queue.empty())
+            {
+                for (int i=0;i<5 && !request_queue.empty();i++)
+                {
+                    tasks.push_back(request_queue.front());
+                    request_queue.pop();
+                }
+            }
+            else
+                continue;
+        }
+        for (const auto& task : tasks)
+        {
+            ssize_t n=write (socket_fd, task.first.c_str(), task.first.size());
+            std::string response = getPeerMessage(socket_fd);
+            int piece_id=0;
+            for (int i=5;i<9;i++)
+            {
+                for (int j=0;j<=7;j++)
+                    piece_id |=(1 << 8*(8-i))*((1 << j) & response[i]);
+            }
+            {
+                std::lock_guard lock(responses_mutex[piece_id]);
+                piece_scrambled_responses[piece_id].push_back(response);
+            }
+        }
+    }
+}
+void downloadPiece (int piece_id)
+{
     int p_length=decoded_value["info"]["piece length"];
     if ((piece_id+1)*p_length>decoded_value["info"]["length"].get<int>())
         p_length=decoded_value["info"]["length"].get<int>()%decoded_value["info"]["piece length"].get<int>();
@@ -360,12 +406,29 @@ std::string downloadPiece (std::string socket_str, int piece_id, std::string pat
     while (true)
     {
         std::string file="";
-        for (const auto& [msg, req_sz] : req)
         {
-            write (socket_fd, msg.c_str(), msg.size());
-            std::string response=getPeerMessage(socket_fd);
-            file.append(response.substr((int)response.size()-req_sz, req_sz));
+            std::lock_guard lock(responses_mutex[piece_id]);
+            piece_scrambled_responses[piece_id].clear();
         }
+        for (const auto& ind : req)
+        {
+            std::lock_guard lock(request_queue_mutex);
+            request_queue.push(ind);
+        }
+        while (piece_scrambled_responses[piece_id].size()<req.size());
+        std::lock_guard lock(responses_mutex[piece_id]);
+        std::sort (piece_scrambled_responses[piece_id].begin(), piece_scrambled_responses[piece_id].end(), [&] (std::string a, std::string b)
+        {
+            long long a_offset=0, b_offset=0;
+            for (int i=9;i<13;i++)
+            {
+                for (int j=0;j<=7;j++)
+                    a_offset |=(1 << 8*(12-i))*((1 << j) & a[i]), b_offset |=(1 << 8*(12-i))*((1 << j) & b[i]);
+            }
+            return a_offset<b_offset;
+        });
+        for (const auto& str : piece_scrambled_responses[piece_id])
+            file.append(str.substr(13, (int)str.size()-13));
         unsigned char hash[SHA_DIGEST_LENGTH];
         SHA1(reinterpret_cast<const unsigned char*>(file.data()), file.size(), hash);
         std::stringstream oss;
@@ -376,7 +439,10 @@ std::string downloadPiece (std::string socket_str, int piece_id, std::string pat
         for (int i=piece_id*20;i<(piece_id+1)*20;i++)
             oss2 << std::hex << std::setfill('0') << std::setw(2) << (int)(unsigned char)decoded_value["info"]["pieces"].get<std::string>()[i];
         if (oss2.str()==hex_hash)
-            return file;
+        {
+            pieces[piece_id]=file;
+            return;
+        }
     }
 }
 int main(int argc, char* argv[]) {
@@ -430,7 +496,7 @@ int main(int argc, char* argv[]) {
         std::cout << "Peer ID: ";
         std::cout << peerHandshake(argv[3], argv[2]).second << "\n";
     }
-    else if (command == "download_piece")
+    else if (command == "download_piece" || command == "download")
     {
         std::string peer_list=peerList(argv[4]);
         std::vector<std::string> sockets;
@@ -445,8 +511,35 @@ int main(int argc, char* argv[]) {
             pos=pos+5;
             sockets.push_back(ip+":"+std::to_string(port));
         }
+        for (const auto& socket : sockets)
+        {
+            std::thread th(worker, socket, argv[4]);
+            th.detach();
+        }
         std::ofstream g (argv[3]);
-        g << downloadPiece (sockets[0], atoi(argv[5]), argv[4]);
+        int nr_pieces = (decoded_value["info"]["length"].get<int>()+decoded_value["info"]["piece length"].get<int>()-1)/decoded_value["info"]["piece length"].get<int>();
+        pieces.resize(nr_pieces);
+        piece_scrambled_responses.resize(nr_pieces);
+        std::vector<std::mutex> list(nr_pieces);
+        responses_mutex.swap(list);
+        if (command == "download_piece")
+        {
+            downloadPiece (atoi(argv[5]));
+            g << pieces[atoi(argv[5])];
+        }
+        else
+        {
+            std::vector<std::thread> threads;
+            for (int i=0;i<nr_pieces;i++)
+            {
+                std::thread req_piece (downloadPiece, i);
+                threads.push_back(std::move(req_piece));
+            }
+            for (auto& thread : threads)
+                thread.join();
+            for (int i=0;i<nr_pieces;i++)
+                g << pieces[i];
+        }
     }
     else {
         std::cerr << "unknown command: " << command << std::endl;
