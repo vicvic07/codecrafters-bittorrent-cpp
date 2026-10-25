@@ -3,9 +3,11 @@
 #include <vector>
 #include <cctype>
 #include <cstdlib>
+#include <fstream>
 #include <arpa/inet.h>
 #include <openssl/sha.h>
 #include <unistd.h>
+#include <netdb.h>
 #include "lib/nlohmann/json.hpp"
 
 using json = nlohmann::json;
@@ -14,6 +16,7 @@ json decodeBencodedList (std::string encoded_value, int &pos);
 json decodeBencodedDictionary (std::string encoded_value, int &pos);
 json decodeBencodedInteger (std::string encoded_value, int &pos);
 json decodeBencodedString (std::string encoded_value, int &pos);
+json decoded_value;
 std::string getNextWord (std::string input, int &pos, const char* ch)
 {
     std::string ret="";
@@ -130,6 +133,252 @@ std::string getInfoHash (std::string input)
         oss << std::setw(2) << std::setfill('0') << std::hex << (int)c;
     return oss.str();
 }
+std::string peerList (std::string path)
+{
+    std::string ret="";
+    FILE *f;
+        if (f=fopen (path.c_str(), "r"))
+        {
+            std::string input = extractTorrentInfo(f);
+            decoded_value=decodeAll(input);
+            std::string reversed_url=decoded_value["announce"].dump().substr(1, (int)decoded_value["announce"].dump().size()-2), ip_str;
+            std::reverse(reversed_url.begin(), reversed_url.end());
+            int pos=0;
+            std::string path = getNextWord(reversed_url, pos, "/");
+            std::string url = getNextWord(reversed_url, pos, "");
+            std::reverse(url.begin(), url.end());
+            int pos4=0, port=80;
+            std::string addr="";
+            std::string hostname=getNextWord(url, pos4, "/");
+            hostname=getNextWord(url, pos4, "/");
+            pos4=0;
+            int tracker_fd=socket(AF_INET, SOCK_STREAM, 0);
+            struct sockaddr_in tracker;
+            if (hostname.find(':')!=std::string::npos)
+            {
+                addr=getNextWord(hostname, pos4, ":");
+                port=atoi(getNextWord(hostname, pos4, ":/").c_str());
+                ip_str=addr+":"+std::to_string(port);
+                tracker.sin_family = AF_INET;
+                tracker.sin_addr.s_addr = inet_addr(addr.c_str());
+                tracker.sin_port = htons(port);
+            }
+            else
+            {
+                addrinfo hints{};
+                hints.ai_family=AF_UNSPEC;
+                hints.ai_socktype=SOCK_STREAM;
+                addrinfo *result;
+                int stat = getaddrinfo(hostname.c_str(), "80", &hints, &result);
+                if (stat != 0)
+                {
+                    std::cerr << gai_strerror(stat) << "\n";
+                    _exit (1);
+                }
+                for (addrinfo *r=result;r!=nullptr;r=r -> ai_next)
+                {
+                    if (r -> ai_family==AF_INET)
+                    {
+                        char ip[INET6_ADDRSTRLEN];
+                        auto* address = &reinterpret_cast<sockaddr_in*>(r -> ai_addr)->sin_addr;
+                        tracker=*reinterpret_cast<sockaddr_in*>(r -> ai_addr);
+                        port=ntohs(tracker.sin_port);
+                        inet_ntop(r -> ai_family, address, ip, INET6_ADDRSTRLEN);
+                        ip_str=hostname+":"+std::to_string(port);
+                        break;
+                    }
+                }
+                freeaddrinfo(result);
+            }
+            path+='/';
+            std::reverse (path.begin(), path.end());
+            int pos3=0;
+            std::string hash_hex=getInfoHash(input);
+            std::string hash="";
+            for (int i=0;i<hash_hex.size()-1;i+=2)
+                hash.append(1, '%'), hash.append(1, hash_hex[i]), hash.append(1, hash_hex[i+1]);
+            std::string header="GET "+path+"?info_hash="+hash+"&peer_id="+"67676767676767676767&port=6881&uploaded=0&downloaded=0&left="+decoded_value["info"]["length"].dump()+"&compact=1 "+"HTTP/1.1\r\nHost: "+ip_str+"\r\nUser-Agent: BitTorrent-Peer\r\nAccept: */*\r\n";
+            std::string body="\r\n";
+            std::cerr << header+body << "\n";
+            int pos2=0;
+            if (connect (tracker_fd, (struct sockaddr*)&tracker, sizeof(tracker))>=0)
+            {
+                if (ssize_t n=write (tracker_fd, (header+body).c_str(), (header+body).size()))
+                {
+                    char buff[4096];
+                    ssize_t bytes=read (tracker_fd, buff, sizeof(buff));
+                    while (!(buff[pos]=='\r' && buff[pos+1]=='\n' && buff[pos+2]=='\r' && buff[pos+3]=='\n'))
+                        ++pos;
+                    pos+=4;
+                    std::string bytes_string="";
+                    for (;pos<bytes;pos++)
+                        bytes_string.append(1, buff[pos]);
+                    json decoded_response = decodeAll(bytes_string);
+                    std::string sockets=decoded_response["peers"].get<std::string>();
+                    for (int i=0;i<sockets.size();i+=6)
+                    {
+                        int v[4]={(int)(unsigned char)sockets[i], (int)(unsigned char)sockets[i+1], (int)(unsigned char)sockets[i+2], (int)(unsigned char)sockets[i+3]};
+                        int port=(int)(unsigned char)sockets[i+4]*(1 << 8)+(int)(unsigned char)sockets[i+5];
+                        for (int i=0;i<4;i++)
+                        {
+                            ret.append(std::to_string(v[i]));
+                            if (i!=3)
+                                ret.append(1, '.');
+                        }
+                        ret.append(1, ':');
+                        ret.append(std::to_string(port));
+                    }
+                }
+                else
+                    std::cerr << "Write to tracker failed!\n";
+
+            }
+            else
+                std::cerr << "Connection to tracker failed!\n";
+        }
+        else
+            std::cerr << "Can't open info file\n";
+    return ret;
+}
+std::pair <int, std::string> peerHandshake (std::string socket_str, std::string path)
+{
+    std::pair <int, std::string> ret;
+    int pos=0;
+    std::string ip_string = getNextWord(socket_str, pos, ":");
+    int port = atoi(getNextWord(socket_str, pos, ":\r\n \t").c_str());
+    int peer_fd;
+    struct sockaddr_in peer;
+    peer_fd = socket(AF_INET, SOCK_STREAM, 0);
+    ret.first=peer_fd;
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(port);
+    peer.sin_addr.s_addr = inet_addr(ip_string.c_str());
+    FILE *f;
+    if (connect (peer_fd, (struct sockaddr*)&peer, sizeof(peer))>=0)
+    {
+        if (f=fopen(path.c_str(), "r"))
+        {
+            std::string input = extractTorrentInfo(f);
+            std::string hash_hex = getInfoHash(input);
+            std::string wr;
+            wr.append(1, 0b00010011);
+            wr.append("BitTorrent protocol");
+            wr.append(8, 0b00000000);
+            wr.append(std::string(reinterpret_cast<const char*>(info_dict_hash)));
+            for (int i=1;i<=20;i++)
+                wr.append(1, rand()%257);
+            write (peer_fd, wr.c_str(), wr.size());
+            char buff[4096];
+            ssize_t n=read(peer_fd, buff, sizeof(buff));
+            std::stringstream oss;
+            for (int i=n-20;i<n;i++)
+                oss << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)buff[i];
+            ret.second=oss.str();
+        }
+        else
+            std::cerr << "Can't open info file\n";
+    }
+    else
+        std::cerr << "Can't connect to peer\n";
+    return ret;
+}
+std::string getPeerMessage (int fd)
+{
+    char buff[16*1024];
+    ssize_t n=0;
+    std::string ret="";
+    while (n<4)
+    {
+        ssize_t m=read(fd, buff, sizeof(buff));
+        n+=m;
+        for (int i=0;i<m;i++)
+            ret.append(1, buff[i]);
+    }
+    unsigned int total_sz=0;
+    for (int i=0;i<=3;i++)
+        total_sz+=(1 << (8*(3-i)))*(int)(unsigned char)ret[i];
+    while (n<total_sz)
+    {
+        ssize_t m=read(fd, buff, sizeof(buff));
+        n+=m;
+        for (int i=0;i<m;i++)
+            ret.append(1, buff[i]);
+    }
+    return ret;
+}
+std::string downloadPiece (std::string socket_str, int piece_id, std::string path)
+{
+    auto [socket_fd, peer_id]=peerHandshake(socket_str, path);
+    std::string msg=getPeerMessage(socket_fd);
+    std::string wr="";
+    wr.append(5, 0x00);
+    wr[3]=0x01;
+    wr[4]=0x02;
+    write (socket_fd, wr.c_str(), (unsigned int)wr.size());
+    msg=getPeerMessage(socket_fd);
+    int p_length=decoded_value["info"]["piece length"];
+    if ((piece_id+1)*p_length>decoded_value["info"]["length"].get<int>())
+        p_length=decoded_value["info"]["length"].get<int>()%decoded_value["info"]["piece length"].get<int>();
+    long long offset=0;
+    int block_length=(1 << 14);
+    std::vector<std::pair<std::string, int>> req;
+    for (int i=0;i<p_length/(1 << 14)+(p_length%(1 << 14)!=0);i++, offset+=(1 << 14))
+    {
+        std::string wr="";
+        wr.append(5, 0x00);
+        wr[4]=0x06;
+        wr.append(4, 0x00);
+        int piece_id_c=piece_id;
+        for (int i=(int)wr.size()-1;i>=(int)wr.size()-4;i--, piece_id_c >>=8)
+        {
+            for (int j=0;j<=7;j++)
+                wr[i] |=(piece_id_c & (1 << j));
+        }
+        wr.append(4, 0x00);
+        long long offset_c=offset;
+        for (int i=(int)wr.size()-1;i>=(int)wr.size()-4;i--, offset_c >>=8)
+        {
+            for (int j=0;j<=7;j++)
+                wr[i] |=(offset_c & (1 << j));
+        }
+        int req_sz=std::min (block_length, p_length-block_length*i);
+        wr.append(4, 0x00);
+        int req_sz_c=req_sz;
+        for (int i=(int)wr.size()-1;i>=(int)wr.size()-4;i--, req_sz_c >>=8)
+        {
+            for (int j=0;j<=7;j++)
+                wr[i] |=(req_sz_c & (1 << j));
+        }
+        int total_sz=(int)wr.size()-4;
+        for (int i=3;i>=0;i--, total_sz >>=8)
+        {
+            for (int j=0;j<=7;j++)
+                wr[i] |=(total_sz & (1 << j));
+        }
+        req.push_back({wr, req_sz});
+    }
+    while (true)
+    {
+        std::string file="";
+        for (const auto& [msg, req_sz] : req)
+        {
+            write (socket_fd, msg.c_str(), msg.size());
+            std::string response=getPeerMessage(socket_fd);
+            file.append(response.substr((int)response.size()-req_sz, req_sz));
+        }
+        unsigned char hash[SHA_DIGEST_LENGTH];
+        SHA1(reinterpret_cast<const unsigned char*>(file.data()), file.size(), hash);
+        std::stringstream oss;
+        for (int i=0;i<SHA_DIGEST_LENGTH;i++)
+            oss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+        std::string hex_hash=oss.str();
+        std::stringstream oss2;
+        for (int i=piece_id*20;i<(piece_id+1)*20;i++)
+            oss2 << std::hex << std::setfill('0') << std::setw(2) << (int)(unsigned char)decoded_value["info"]["pieces"].get<std::string>()[i];
+        if (oss2.str()==hex_hash)
+            return file;
+    }
+}
 int main(int argc, char* argv[]) {
     // Flush after every std::cout / std::cerr
     std::cout << std::unitbuf;
@@ -151,7 +400,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "Logs from your program will appear here!" << std::endl;
 
         std::string encoded_value = argv[2];
-        json decoded_value = decodeAll(encoded_value);
+        decoded_value = decodeAll(encoded_value);
         std::cout << decoded_value.dump() << std::endl;
     }
     else if (command == "info")
@@ -161,7 +410,7 @@ int main(int argc, char* argv[]) {
         {
             std::string input = extractTorrentInfo(f);
             std::string hash = getInfoHash(input);
-            json decoded_value = decodeAll(input);
+            decoded_value = decodeAll(input);
             std::cout << "Tracker URL: " << decoded_value["announce"].dump().substr(1, (int)decoded_value["announce"].dump().size() - 2) << "\nLength: " << decoded_value["info"]["length"].dump() << "\n";
             std::cout << "Info Hash: " << hash << "\nPiece Length: " << decoded_value["info"]["piece length"].dump() << "\nPieces: ";
             std::stringstream oss;
@@ -174,114 +423,30 @@ int main(int argc, char* argv[]) {
     }
     else if (command == "peers")
     {
-        FILE *f;
-        if (f=fopen (argv[2], "r"))
-        {
-            std::string input = extractTorrentInfo(f);
-            json decoded_value=decodeAll(input);
-            std::string reversed_url=decoded_value["announce"].dump().substr(1, (int)decoded_value["announce"].dump().size()-2);
-            std::reverse(reversed_url.begin(), reversed_url.end());
-            int pos=0;
-            std::string path = getNextWord(reversed_url, pos, "/");
-            std::string url = getNextWord(reversed_url, pos, "");
-            std::reverse(url.begin(), url.end());
-            path+='/';
-            std::reverse (path.begin(), path.end());
-            int pos3=0;
-            std::string hash_hex=getInfoHash(input);
-            std::string hash="";
-            for (int i=0;i<hash_hex.size()-1;i+=2)
-                hash.append(1, '%'), hash.append(1, hash_hex[i]), hash.append(1, hash_hex[i+1]);
-            std::string header="GET "+path+"?info_hash="+hash+"&peer_id="+"67676767676767676767&port=6881&uploaded=0&downloaded=0&left="+decoded_value["info"]["length"].dump()+"&compact=1 "+"HTTP/1.1\r\nHost: "+getNextWord(url, pos3, "htp:/");
-            header+=":"+getNextWord(url, pos3, ":\r\n/")+"\r\nUser-Agent: BitTorrent-Peer\r\nAccept: */*\r\n";
-            std::string body="\r\n";
-            std::cerr << header+body << "\n";
-            int pos2=0;
-            std::string addr = getNextWord(url, pos2, "htp:/");
-            std::string port = getNextWord(url, pos2, "/:\n\r");
-            int tracker_fd = socket(AF_INET, SOCK_STREAM, 0);
-            struct sockaddr_in tracker;
-            tracker.sin_family = AF_INET;
-            tracker.sin_addr.s_addr = inet_addr(addr.c_str());
-            tracker.sin_port = htons(atoi(port.c_str()));
-            if (connect (tracker_fd, (struct sockaddr*)&tracker, sizeof(tracker))>=0)
-            {
-                if (ssize_t n=write (tracker_fd, (header+body).c_str(), (header+body).size()))
-                {
-                    char buff[4096];
-                    ssize_t bytes=read (tracker_fd, buff, sizeof(buff));
-                    while (!(buff[pos]=='\r' && buff[pos+1]=='\n' && buff[pos+2]=='\r' && buff[pos+3]=='\n'))
-                        ++pos;
-                    pos+=4;
-                    std::string bytes_string="";
-                    for (;pos<bytes;pos++)
-                        bytes_string.append(1, buff[pos]);
-                    json decoded_response = decodeAll(bytes_string);
-                    std::string sockets=decoded_response["peers"].get<std::string>();
-                    for (int i=0;i<sockets.size();i+=6)
-                    {
-                        int v[4]={(int)(unsigned char)sockets[i], (int)(unsigned char)sockets[i+1], (int)(unsigned char)sockets[i+2], (int)(unsigned char)sockets[i+3]};
-                        int port=(int)(unsigned char)sockets[i+4]*(1 << 8)+(int)(unsigned char)sockets[i+5];
-                        for (int i=0;i<4;i++)
-                        {
-                            std::cout << v[i];
-                            if (i!=3)
-                                std::cout << ".";
-                        }
-                        std::cout << ":" << port << "\n";
-                    }
-                }
-                else
-                    std::cerr << "Write to tracker failed!\n";
-
-            }
-            else
-                std::cerr << "Connection to tracker failed!\n";
-        }
-        else
-            std::cerr << "Can't open info file\n";
+        std::cout << peerList(argv[2]) << "\n";
     }
     else if (command == "handshake")
     {
-
+        std::cout << "Peer ID: ";
+        std::cout << peerHandshake(argv[3], argv[2]).second << "\n";
+    }
+    else if (command == "download_piece")
+    {
+        std::string peer_list=peerList(argv[4]);
+        std::vector<std::string> sockets;
         int pos=0;
-        std::string ip_string = getNextWord(argv[3], pos, ":");
-        int port = atoi(getNextWord(argv[3], pos, ":\r\n \t").c_str());
-        int peer_fd;
-        struct sockaddr_in peer;
-        peer_fd = socket(AF_INET, SOCK_STREAM, 0);
-        peer.sin_family = AF_INET;
-        peer.sin_port = htons(port);
-        peer.sin_addr.s_addr = inet_addr(ip_string.c_str());
-        FILE *f;
-        if (connect (peer_fd, (struct sockaddr*)&peer, sizeof(peer))>=0)
+        while (pos<peer_list.size())
         {
-            if (f=fopen(argv[2], "r"))
-            {
-                std::string input = extractTorrentInfo(f);
-                std::string hash_hex = getInfoHash(input);
-                std::string wr;
-                wr.append(1, 0b00010011);
-                wr.append("BitTorrent protocol");
-                wr.append(8, 0b00000000);
-                wr.append(std::string(reinterpret_cast<const char*>(info_dict_hash)));
-                for (int i=1;i<=20;i++)
-                    wr.append(1, rand()%257);
-                std::cout << wr << "\n";
-                write (peer_fd, wr.c_str(), wr.size());
-                char buff[4096];
-                ssize_t n=read(peer_fd, buff, sizeof(buff));
-                std::cout << "Peer ID: ";
-                std::stringstream oss;
-                for (int i=n-20;i<n;i++)
-                    oss << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)buff[i];
-                std::cout << oss.str() << "\n";
-            }
-            else
-                std::cerr << "Can't open info file\n";
+            std::string ip=getNextWord(peer_list, pos, ":");
+            int port=0;
+            ++pos;
+            for (int i=pos;i<pos+5;i++)
+                port=port*10+peer_list[i]-'0';
+            pos=pos+5;
+            sockets.push_back(ip+":"+std::to_string(port));
         }
-        else
-            std::cerr << "Can't connect to peer\n";
+        std::ofstream g (argv[3]);
+        g << downloadPiece (sockets[0], atoi(argv[5]), argv[4]);
     }
     else {
         std::cerr << "unknown command: " << command << std::endl;
