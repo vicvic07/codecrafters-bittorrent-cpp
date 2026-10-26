@@ -691,9 +691,11 @@ int main(int argc, char* argv[])
             std::vector<std::thread> threads;
             for (int i=0;i<nr_pieces;i++)
             {
-                std::thread req_piece (downloadPiece, i);
-                req_piece.join();
+                std::thread th(downloadPiece, i);
+                threads.push_back(std::move(th));
             }
+            for (auto& th : threads)
+                th.join();
             for (int i=0;i<nr_pieces;i++)
                 g.write(pieces[i].data(), pieces[i].size());
         }
@@ -747,8 +749,14 @@ int main(int argc, char* argv[])
         }
         else
         {
+            std::vector<std::thread> threads;
             for (int i=0;i<nr_pieces;i++)
-                downloadPiece(i);
+            {
+                std::thread th(downloadPiece, i);
+                threads.push_back(std::move(th));
+            }
+            for (auto& th : threads)
+                th.join();
             for (int i=0;i<nr_pieces;i++)
                 g.write(pieces[i].data(), pieces[i].size());
         }
