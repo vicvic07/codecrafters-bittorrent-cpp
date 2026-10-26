@@ -18,12 +18,15 @@
 using json = nlohmann::json;
 unsigned char info_dict_hash[SHA_DIGEST_LENGTH];
 std::string hash_hex;
+/// file info
+unsigned int total_size=-1, piece_length, nr_pieces;
+std::string piece_hashes;
+/// end file info
 json decodeBencodedList (std::string encoded_value, int &pos);
 json decodeBencodedDictionary (std::string encoded_value, int &pos);
 json decodeBencodedInteger (std::string encoded_value, int &pos);
 json decodeBencodedString (std::string encoded_value, int &pos);
 json decoded_value;
-int total_size=-1;
 std::string announce_url;
 std::vector<std::string> pieces;
 std::vector<std::pair<std::pair<std::string, int>, int>> request_queue;
@@ -180,7 +183,10 @@ void initializeTorrentInfo (std::string path)
         std::string hsh = getInfoHash(input);
         decoded_value=decodeAll(input);
         announce_url=decoded_value["announce"].dump().substr(1, (int)decoded_value["announce"].dump().size()-2);
-        total_size=decoded_value["info"]["length"].get<int>();
+        total_size=decoded_value["info"]["length"].get<unsigned int>();
+        piece_length = decoded_value["info"]["piece length"].get<unsigned int>();
+        nr_pieces=(total_size+piece_length-1)/piece_length;
+        piece_hashes = decoded_value["info"]["pieces"].get<std::string>();
     }
     else
         std::cerr << "Can't open path: " << path << "\n";
@@ -370,18 +376,54 @@ std::pair <int, std::pair<std::string, int>> peerHandshake (std::string socket_s
         std::cerr << "Can't connect to peer\n";
     return ret;
 }
-void worker (std::string socket_str)
+std::pair<int, std::pair<std::string, int>> peerHandshakeExtension (std::string socket)
 {
-    auto ret=peerHandshake(socket_str, {});
+    auto ret=peerHandshake(socket, {20});
+    int peer_fd=ret.first;
+    std::string peer_id=ret.second.first;
+    int supports_all_extensions=ret.second.second;
+    char buff[4096];
+    read (peer_fd, buff, 6); /// bitfield
+    std::string wr="";
+    wr.append(4, 0x00);
+    wr.append(1, 20);
+    wr.append(1, 0x00);
+    wr.append("d1:md11:ut_metadatai67eee");
+    int sz=(int)wr.size()-4;
+    for (int i=3;i>=0;i--, sz >>=8)
+    {
+        for (int j=0;j<8;j++)
+            wr[i] |=(sz & (1 << j));
+    }
+    if (supports_all_extensions)
+    {
+        write (peer_fd, wr.c_str(), wr.size());
+        std::string recv_hand;
+        ssize_t n=read(peer_fd, buff, sizeof(buff));
+        for (int i=0;i<n;i++)
+            recv_hand.append(1, buff[i]);
+        decoded_value = decodeAll(recv_hand.substr(6, (int)recv_hand.size()-6));
+    }
+    return ret;
+}
+void worker (std::string socket_str, bool ext)
+{
+    std::pair<int, std::pair<std::string, int>> ret;
+    if (ext)
+        ret=peerHandshakeExtension(socket_str);
+    else
+    {
+        ret=peerHandshake(socket_str, {});
+        std::string msg=getPeerMessage(ret.first);
+    }
     std::string peer_id=ret.second.first;
     int socket_fd=ret.first;
-    std::string msg=getPeerMessage(socket_fd);
     std::string wr="";
     wr.append(5, 0x00);
     wr[3]=0x01;
     wr[4]=0x02;
     write (socket_fd, wr.c_str(), (unsigned int)wr.size());
-    msg=getPeerMessage(socket_fd);
+    std::string msg=getPeerMessage(socket_fd);
     while (1)
     {
         std::vector<std::pair<std::pair<std::string, int>, int>> tasks;
@@ -396,6 +438,7 @@ void worker (std::string socket_str)
         for (const auto& task : tasks)
         {
             ssize_t n=write (socket_fd, task.first.first.c_str(), task.first.first.size());
+
             std::string response = getPeerMessage(socket_fd);
             {
                 std::lock_guard lock(responses_mutex[task.second]);
@@ -406,11 +449,11 @@ void worker (std::string socket_str)
 }
 void downloadPiece (int piece_id)
 {
-    int p_length=decoded_value["info"]["piece length"];
-    if ((piece_id+1)*p_length>decoded_value["info"]["length"].get<int>())
-        p_length=decoded_value["info"]["length"].get<int>()%decoded_value["info"]["piece length"].get<int>();
+    unsigned int p_length=piece_length;
+    if ((piece_id+1)*p_length>total_size)
+        p_length=total_size%piece_length;
     long long offset=0;
-    int block_length=(1 << 14);
+    unsigned int block_length=(1 << 14);
     std::vector<std::pair<std::string, int>> req;
     for (int i=0;i<p_length/(1 << 14)+(p_length%(1 << 14)!=0);i++, offset+=(1 << 14))
     {
@@ -467,7 +510,7 @@ void downloadPiece (int piece_id)
             if (piece_scrambled_responses[piece_id].size()==req.size())
                 break;
         }
-        std::cout << piece_id << std::endl;
+        std::cerr << piece_id << std::endl;
         std::lock_guard lock(responses_mutex[piece_id]);
         std::sort (piece_scrambled_responses[piece_id].begin(), piece_scrambled_responses[piece_id].end(), [&] (std::string a, std::string b)
         {
@@ -489,7 +532,7 @@ void downloadPiece (int piece_id)
         std::string hex_hash=oss.str();
         std::stringstream oss2;
         for (int i=piece_id*20;i<(piece_id+1)*20;i++)
-            oss2 << std::hex << std::setfill('0') << std::setw(2) << (int)(unsigned char)decoded_value["info"]["pieces"].get<std::string>()[i];
+            oss2 << std::hex << std::setfill('0') << std::setw(2) << (int)(unsigned char)piece_hashes[i];
         if (oss2.str()==hex_hash)
         {
             pieces[piece_id]=file;
@@ -505,36 +548,6 @@ void downloadPiece (int piece_id)
         }
     }
 }
-std::pair<int, std::pair<std::string, int>> peerHandshakeExtension (std::string socket)
-{
-    auto ret=peerHandshake(socket, {20});
-    int peer_fd=ret.first;
-    std::string peer_id=ret.second.first;
-    int supports_all_extensions=ret.second.second;
-    char buff[4096];
-    read (peer_fd, buff, 6); /// bitfield
-    std::string wr="";
-    wr.append(4, 0x00);
-    wr.append(1, 20);
-    wr.append(1, 0x00);
-    wr.append("d1:md11:ut_metadatai67eee");
-    int sz=(int)wr.size()-4;
-    for (int i=3;i>=0;i--, sz >>=8)
-    {
-        for (int j=0;j<8;j++)
-            wr[i] |=(sz & (1 << j));
-    }
-    if (supports_all_extensions)
-    {
-        write (peer_fd, wr.c_str(), wr.size());
-        std::string recv_hand;
-        ssize_t n=read(peer_fd, buff, sizeof(buff));
-        for (int i=0;i<n;i++)
-            recv_hand.append(1, buff[i]);
-        decoded_value = decodeAll(recv_hand.substr(6, (int)recv_hand.size()-6));
-    }
-    return ret;
-}
 std::string hexHashOf (std::string input)
 {
     unsigned char hash[SHA_DIGEST_LENGTH];
@@ -542,8 +555,65 @@ std::string hexHashOf (std::string input)
     std::stringstream oss;
     for (int i=0;i<SHA_DIGEST_LENGTH;i++)
         oss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
-    std::cerr << oss.str() << " " << hash_hex << "\n";
     return oss.str();
+}
+std::vector<std::string> getSockets (std::string peer_list)
+{
+    std::vector<std::string> sockets;
+    int pos=0;
+    while (pos<peer_list.size())
+    {
+        std::string ip=getNextWord(peer_list, pos, ":");
+        int port=0;
+        ++pos;
+        for (int i=pos;i<pos+5;i++)
+            port=port*10+peer_list[i]-'0';
+        pos=pos+5;
+        sockets.push_back(ip+":"+std::to_string(port));
+    }
+    return sockets;
+}
+void getFileInfoMagnet ()
+{
+    std::string peer_list=peerList();
+    auto sockets = getSockets(peer_list);
+    auto ret = peerHandshakeExtension(sockets[0]);
+    int peer_fd=ret.first;
+    std::string wr="";
+    wr.append(4, 0x00);
+    wr.append(1, 20);
+    wr.append(1, decoded_value["m"]["ut_metadata"].get<int>());
+    wr.append("d8:msg_typei0e5:piecei0ee");
+    int sz = wr.size()-4;
+    for (int i=3;i>=0;i--, sz >>=8)
+    {
+        for (int j=0;j<=7;j++)
+            wr[i] |=((1 << j) & sz);
+    }
+    write (peer_fd, wr.c_str(), wr.size());
+    char buff[4096];
+    ssize_t n=read(peer_fd, buff, sizeof(buff));
+    std::string info="";
+    for (int i=0;i<n;i++)
+        info.append(1, buff[i]);
+    decoded_value = decodeAll(info.substr(6, (int)info.size()-6));
+    nr_pieces=(decoded_value["length"].get<unsigned int>()+decoded_value["piece length"].get<unsigned int>()-1)/decoded_value["piece length"].get<unsigned int>();
+    piece_hashes=decoded_value["pieces"].get<std::string>();
+    piece_length=decoded_value["piece length"].get<unsigned int>();
+    total_size=decoded_value["length"].get<unsigned int>();
+    std::string info_contents;
+    int pos=0;
+    for (int i=0;i<info.size()-6;i++)
+    {
+        if (info.substr (i, 6)=="length")
+        {
+            pos=i-3;
+            break;
+        }
+    }
+    if (hash_hex==hexHashOf(info.substr(pos, (int)info.size()-pos)))
+        return;
+    std::cerr << "Peer info hash is different from magnet link info hash\n";
 }
 int main(int argc, char* argv[])
 {
@@ -557,29 +627,11 @@ int main(int argc, char* argv[])
     }
 
     std::string command = argv[1];
-    auto getSockets = [&] (std::string peer_list)
-    {
-        std::vector<std::string> sockets;
-        int pos=0;
-        while (pos<peer_list.size())
-        {
-            std::string ip=getNextWord(peer_list, pos, ":");
-            int port=0;
-            ++pos;
-            for (int i=pos;i<pos+5;i++)
-                port=port*10+peer_list[i]-'0';
-            pos=pos+5;
-            sockets.push_back(ip+":"+std::to_string(port));
-        }
-        return sockets;
-    };
     if (command == "decode") {
         if (argc < 3) {
             std::cerr << "Usage: " << argv[0] << " decode <encoded_value>" << std::endl;
             return 1;
         }
-        // You can use print statements as follows for debugging, they'll be visible when running tests.
-        std::cerr << "Logs from your program will appear here!" << std::endl;
 
         std::string encoded_value = argv[2];
         decoded_value = decodeAll(encoded_value);
@@ -621,11 +673,10 @@ int main(int argc, char* argv[])
         auto sockets=getSockets(peer_list);
         for (const auto& socket : sockets)
         {
-            std::thread th(worker, socket);
+            std::thread th(worker, socket, 0);
             th.detach();
         }
         std::ofstream g (argv[3], std::ios::binary);
-        int nr_pieces = (decoded_value["info"]["length"].get<int>()+decoded_value["info"]["piece length"].get<int>()-1)/decoded_value["info"]["piece length"].get<int>();
         pieces.resize(nr_pieces);
         piece_scrambled_responses.resize(nr_pieces);
         std::vector<std::mutex> list(nr_pieces);
@@ -666,49 +717,41 @@ int main(int argc, char* argv[])
     else if (command == "magnet_info")
     {
         initializeTorrentInfoMagnet(argv[2]);
+        getFileInfoMagnet();
+        std::cout << "Tracker URL: " << announce_url << "\nLength: " << decoded_value["length"].dump() << "\nInfo Hash: " << hash_hex << "\nPiece Length: " << decoded_value["piece length"].dump() << "\nPiece Hashes: ";
+        std::stringstream oss;
+        for (const auto& ch : decoded_value["pieces"].get<std::string>())
+            oss << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)ch;
+        std::cout << oss.str() << "\n";
+    }
+    else if (command == "magnet_download_piece" || command == "magnet_download")
+    {
+        initializeTorrentInfoMagnet(argv[4]);
+        getFileInfoMagnet();
         std::string peer_list=peerList();
         auto sockets = getSockets(peer_list);
-        auto ret = peerHandshakeExtension(sockets[0]);
-        int peer_fd=ret.first;
-        std::string wr="";
-        wr.append(4, 0x00);
-        wr.append(1, 20);
-        wr.append(1, decoded_value["m"]["ut_metadata"].get<int>());
-        wr.append("d8:msg_typei0e5:piecei0ee");
-        int sz = wr.size()-4;
-        for (int i=3;i>=0;i--, sz >>=8)
+        for (const auto& socket : sockets)
         {
-            for (int j=0;j<=7;j++)
-                wr[i] |=((1 << j) & sz);
+            std::thread th(worker, socket, 1);
+            th.detach();
         }
-        write (peer_fd, wr.c_str(), wr.size());
-        char buff[4096];
-        ssize_t n=read(peer_fd, buff, sizeof(buff));
-        std::string info="";
-        for (int i=0;i<n;i++)
-            info.append(1, buff[i]);
-        decoded_value = decodeAll(info.substr(6, (int)info.size()-6));
-        std::string info_contents;
-        int pos=0;
-        for (int i=0;i<info.size()-6;i++)
+        std::ofstream g (argv[3], std::ios::binary);
+        pieces.resize(nr_pieces);
+        piece_scrambled_responses.resize(nr_pieces);
+        std::vector<std::mutex> list(nr_pieces);
+        responses_mutex.swap(list);
+        if (command == "magnet_download_piece")
         {
-            if (info.substr (i, 6)=="length")
-            {
-                pos=i-3;
-                break;
-            }
-        }
-        std::cerr << info.substr(pos, (int)info.size()-pos) << "\n";
-        if (hash_hex==hexHashOf(info.substr(pos, (int)info.size()-pos)))
-        {
-            std::cout << "Tracker URL: " << announce_url << "\nLength: " << decoded_value["length"].dump() << "\nInfo Hash: " << hash_hex << "\nPiece Length: " << decoded_value["piece length"].dump() << "\nPiece Hashes: ";
-            std::stringstream oss;
-            for (const auto& ch : decoded_value["pieces"].get<std::string>())
-                oss << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)ch;
-            std::cout << oss.str() << "\n";
+            downloadPiece (atoi(argv[5]));
+            g.write(pieces[atoi(argv[5])].data(), pieces[atoi(argv[5])].size());
         }
         else
-            std::cerr << "Peer info hash is different from magnet link info hash\n";
+        {
+            for (int i=0;i<nr_pieces;i++)
+                downloadPiece(i);
+            for (int i=0;i<nr_pieces;i++)
+                g.write(pieces[i].data(), pieces[i].size());
+        }
     }
     else {
         std::cerr << "unknown command: " << command << std::endl;
