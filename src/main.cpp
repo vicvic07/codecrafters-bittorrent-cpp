@@ -115,6 +115,30 @@ json decodeAll (std::string encoded_value)
     }
     return ret;
 }
+std::string getPeerMessage (int fd)
+{
+    char buff[20*1024];
+    ssize_t n=0;
+    std::string ret="";
+    while (n<4)
+    {
+        ssize_t m=read(fd, buff, sizeof(buff));
+        n+=m;
+        for (int i=0;i<m;i++)
+            ret.append(1, buff[i]);
+    }
+    unsigned int total_sz=0;
+    for (int i=0;i<=3;i++)
+        total_sz+=(1 << (8*(3-i)))*(int)(unsigned char)ret[i];
+    while (n<total_sz)
+    {
+        ssize_t m=read(fd, buff, sizeof(buff));
+        n+=m;
+        for (int i=0;i<m;i++)
+            ret.append(1, buff[i]);
+    }
+    return ret;
+}
 std::string extractTorrentInfo (FILE *f)
 {
     char buff[4096];
@@ -297,9 +321,9 @@ std::string peerList ()
                 std::cerr << "Connection to tracker failed!\n";
     return ret;
 }
-std::pair <int, std::string> peerHandshake (std::string socket_str, std::vector<int> extensions)
+std::pair <int, std::pair<std::string, int>> peerHandshake (std::string socket_str, std::vector<int> extensions)
 {
-    std::pair <int, std::string> ret;
+    std::pair <int, std::pair<std::string, int>> ret;
     int pos=0;
     std::string ip_string = getNextWord(socket_str, pos, ":");
     int port = atoi(getNextWord(socket_str, pos, ":\r\n \t").c_str());
@@ -329,43 +353,28 @@ std::pair <int, std::string> peerHandshake (std::string socket_str, std::vector<
                 wr.append(1, rand()%257);
             ssize_t m=write (peer_fd, wr.c_str(), wr.size());
             char buff[4096];
-            ssize_t n=read(peer_fd, buff, sizeof(buff));
+            ssize_t n=read (peer_fd, buff, 68);
+            bool ok=1;
+            for (const auto& bit : extensions)
+            {
+                int pos=bit/8;
+                ok &=!!(buff[27-pos] & (1 << (bit%8)));
+            }
+            ret.second.second=ok;
             std::stringstream oss;
             for (int i=n-20;i<n;i++)
                 oss << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)buff[i];
-            ret.second=oss.str();
+            ret.second.first=oss.str();
     }
     else
         std::cerr << "Can't connect to peer\n";
     return ret;
 }
-std::string getPeerMessage (int fd)
-{
-    char buff[16*1024];
-    ssize_t n=0;
-    std::string ret="";
-    while (n<4)
-    {
-        ssize_t m=read(fd, buff, sizeof(buff));
-        n+=m;
-        for (int i=0;i<m;i++)
-            ret.append(1, buff[i]);
-    }
-    unsigned int total_sz=0;
-    for (int i=0;i<=3;i++)
-        total_sz+=(1 << (8*(3-i)))*(int)(unsigned char)ret[i];
-    while (n<total_sz)
-    {
-        ssize_t m=read(fd, buff, sizeof(buff));
-        n+=m;
-        for (int i=0;i<m;i++)
-            ret.append(1, buff[i]);
-    }
-    return ret;
-}
 void worker (std::string socket_str)
 {
-    auto [socket_fd, peer_id]=peerHandshake(socket_str, {});
+    auto ret=peerHandshake(socket_str, {});
+    std::string peer_id=ret.second.first;
+    int socket_fd=ret.first;
     std::string msg=getPeerMessage(socket_fd);
     std::string wr="";
     wr.append(5, 0x00);
@@ -563,7 +572,7 @@ int main(int argc, char* argv[])
     {
         initializeTorrentInfo(argv[2]);
         std::cout << "Peer ID: ";
-        std::cout << peerHandshake(argv[3], {}).second << "\n";
+        std::cout << peerHandshake(argv[3], {}).second.first << "\n";
     }
     else if (command == "download_piece" || command == "download")
     {
@@ -608,7 +617,27 @@ int main(int argc, char* argv[])
         initializeTorrentInfoMagnet(argv[2]);
         std::string peer_list=peerList();
         auto sockets = getSockets(peer_list);
-        std::cout << "Peer ID: " << peerHandshake(sockets[0], {20}).second << "\n";
+        auto ret=peerHandshake(sockets[0], {20});
+        int peer_fd=ret.first;
+        std::string peer_id=ret.second.first;
+        int supports_all_extensions=ret.second.second;
+        std::cerr << supports_all_extensions << "\n";
+        char buff[4096];
+        ssize_t n=read (peer_fd, buff, sizeof(buff));
+        std::string wr="";
+        wr.append(4, 0x00);
+        wr.append(1, 20);
+        wr.append(1, 0x00);
+        wr.append("d1:md11:ut_metadatai67eee");
+        int sz=(int)wr.size()-4;
+        for (int i=3;i>=0;i--, sz >>=8)
+        {
+            for (int j=0;j<8;j++)
+                wr[i] |=(sz & (1 << j));
+        }
+        if (supports_all_extensions)
+            write (peer_fd, wr.c_str(), wr.size());
+        std::cout << "Peer ID: " << peer_id << "\n";
     }
     else {
         std::cerr << "unknown command: " << command << std::endl;
