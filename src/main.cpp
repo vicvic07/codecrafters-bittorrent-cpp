@@ -505,6 +505,36 @@ void downloadPiece (int piece_id)
         }
     }
 }
+std::pair<int, std::pair<std::string, int>> peerHandshakeExtension (std::string socket)
+{
+    auto ret=peerHandshake(socket, {20});
+    int peer_fd=ret.first;
+    std::string peer_id=ret.second.first;
+    int supports_all_extensions=ret.second.second;
+    char buff[4096];
+    read (peer_fd, buff, 6); /// bitfield
+    std::string wr="";
+    wr.append(4, 0x00);
+    wr.append(1, 20);
+    wr.append(1, 0x00);
+    wr.append("d1:md11:ut_metadatai67eee");
+    int sz=(int)wr.size()-4;
+    for (int i=3;i>=0;i--, sz >>=8)
+    {
+        for (int j=0;j<8;j++)
+            wr[i] |=(sz & (1 << j));
+    }
+    if (supports_all_extensions)
+    {
+        write (peer_fd, wr.c_str(), wr.size());
+        std::string recv_hand;
+        ssize_t n=read(peer_fd, buff, sizeof(buff));
+        for (int i=0;i<n;i++)
+            recv_hand.append(1, buff[i]);
+        decoded_value = decodeAll(recv_hand.substr(6, (int)recv_hand.size()-6));
+    }
+    return ret;
+}
 int main(int argc, char* argv[])
 {
     // Flush after every std::cout / std::cerr
@@ -617,37 +647,31 @@ int main(int argc, char* argv[])
         initializeTorrentInfoMagnet(argv[2]);
         std::string peer_list=peerList();
         auto sockets = getSockets(peer_list);
-        auto ret=peerHandshake(sockets[0], {20});
+        auto ret = peerHandshakeExtension(sockets[0]);
         int peer_fd=ret.first;
         std::string peer_id=ret.second.first;
-        int supports_all_extensions=ret.second.second;
-        std::cerr << supports_all_extensions << "\n";
-        char buff[4096];
+        std::cout << "Peer ID: " << peer_id << "\n";
+        std::cout << "Peer Metadata Extension ID: " << decoded_value["m"]["ut_metadata"].dump() << "\n";
+    }
+    else if (command == "magnet_info")
+    {
+        initializeTorrentInfoMagnet(argv[2]);
+        std::string peer_list=peerList();
+        auto sockets = getSockets(peer_list);
+        auto ret = peerHandshakeExtension(sockets[0]);
+        int peer_fd=ret.first;
         std::string wr="";
         wr.append(4, 0x00);
         wr.append(1, 20);
-        wr.append(1, 0x00);
-        wr.append("d1:md11:ut_metadatai67eee");
-        int sz=(int)wr.size()-4;
+        wr.append(1, decoded_value["m"]["ut_metadata"].get<int>());
+        wr.append("d8:msg_typei0e5:piecei0ee");
+        int sz = wr.size()-4;
         for (int i=3;i>=0;i--, sz >>=8)
         {
-            for (int j=0;j<8;j++)
-                wr[i] |=(sz & (1 << j));
+            for (int j=0;j<=7;j++)
+                wr[i] |=((1 << j) & sz);
         }
-        if (supports_all_extensions)
-        {
-            write (peer_fd, wr.c_str(), wr.size());
-            std::string recv_hand;
-            ssize_t n=read(peer_fd, buff, sizeof(buff));
-            for (int i=0;i<n;i++)
-                recv_hand.append(1, buff[i]);
-            for (const auto& ch : recv_hand)
-                std::cerr << std::hex << std::setw(2) << std::setfill('0') << (unsigned char)ch << " ";
-            std::cerr << "\n";
-            decoded_value = decodeAll(recv_hand.substr(12, (int)recv_hand.size()-12));
-        }
-        std::cout << "Peer ID: " << peer_id << "\n";
-        std::cout << "Peer Metadata Extension ID: " << decoded_value["m"]["ut_metadata"].dump() << "\n";
+        write (peer_fd, wr.c_str(), wr.size());
     }
     else {
         std::cerr << "unknown command: " << command << std::endl;
