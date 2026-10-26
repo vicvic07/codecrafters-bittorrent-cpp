@@ -535,6 +535,16 @@ std::pair<int, std::pair<std::string, int>> peerHandshakeExtension (std::string 
     }
     return ret;
 }
+std::string hexHashOf (std::string input)
+{
+    unsigned char hash[SHA_DIGEST_LENGTH];
+    SHA1(reinterpret_cast<const unsigned char*>(input.c_str()), input.size(), hash);
+    std::stringstream oss;
+    for (int i=0;i<SHA_DIGEST_LENGTH;i++)
+        oss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+    std::cerr << oss.str() << " " << hash_hex << "\n";
+    return oss.str();
+}
 int main(int argc, char* argv[])
 {
     // Flush after every std::cout / std::cerr
@@ -672,6 +682,33 @@ int main(int argc, char* argv[])
                 wr[i] |=((1 << j) & sz);
         }
         write (peer_fd, wr.c_str(), wr.size());
+        char buff[4096];
+        ssize_t n=read(peer_fd, buff, sizeof(buff));
+        std::string info="";
+        for (int i=0;i<n;i++)
+            info.append(1, buff[i]);
+        decoded_value = decodeAll(info.substr(6, (int)info.size()-6));
+        std::string info_contents;
+        int pos=0;
+        for (int i=0;i<info.size()-6;i++)
+        {
+            if (info.substr (i, 6)=="length")
+            {
+                pos=i-3;
+                break;
+            }
+        }
+        std::cerr << info.substr(pos, (int)info.size()-pos) << "\n";
+        if (hash_hex==hexHashOf(info.substr(pos, (int)info.size()-pos)))
+        {
+            std::cout << "Tracker URL: " << announce_url << "\nLength: " << decoded_value["length"].dump() << "\nInfo Hash: " << hash_hex << "\nPiece Length: " << decoded_value["piece length"].dump() << "\nPiece Hashes: ";
+            std::stringstream oss;
+            for (const auto& ch : decoded_value["pieces"].get<std::string>())
+                oss << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)ch;
+            std::cout << oss.str() << "\n";
+        }
+        else
+            std::cerr << "Peer info hash is different from magnet link info hash\n";
     }
     else {
         std::cerr << "unknown command: " << command << std::endl;
