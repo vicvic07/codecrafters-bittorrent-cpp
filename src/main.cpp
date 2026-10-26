@@ -544,6 +544,37 @@ int main(int argc, char* argv[]) {
                 g.write(pieces[i].data(), pieces[i].size());
         }
     }
+    else if (command == "magnet_parse")
+    {
+        std::string input = argv[2];
+        int pos=0;
+        std::string hsh="", tr_link="";
+        while (pos<input.size())
+        {
+            std::string nxt = getNextWord(input, pos, ":&=");
+            if (nxt=="btih")
+                hsh=getNextWord(input, pos, ":&=");
+            else if (nxt=="tr")
+                tr_link=getNextWord(input, pos, ":&=");
+        }
+        std::string tr_link_un="";
+        for (int i=0;i<tr_link.size();i++)
+        {
+            if (i+2<tr_link.size() && tr_link[i]=='%' && tr_link[i+1]=='2' && tr_link[i+2]=='F')
+            {
+                tr_link_un.append(1, '/');
+                i+=2;
+            }
+            else if (i+2<tr_link.size() && tr_link[i]=='%' && tr_link[i+1]=='3' && tr_link[i+2]=='A')
+            {
+                tr_link_un.append(1, ':');
+                i+=2;
+            }
+            else
+                tr_link_un.append(1, tr_link[i]);
+        }
+        std::cout << "Tracker URL: " << tr_link_un << "\nInfo Hash: " << hsh << "\n";
+    }
     else {
         std::cerr << "unknown command: " << command << std::endl;
         return 1;
