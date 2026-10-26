@@ -17,11 +17,14 @@
 
 using json = nlohmann::json;
 unsigned char info_dict_hash[SHA_DIGEST_LENGTH];
+std::string hash_hex;
 json decodeBencodedList (std::string encoded_value, int &pos);
 json decodeBencodedDictionary (std::string encoded_value, int &pos);
 json decodeBencodedInteger (std::string encoded_value, int &pos);
 json decodeBencodedString (std::string encoded_value, int &pos);
 json decoded_value;
+int total_size=-1;
+std::string announce_url;
 std::vector<std::string> pieces;
 std::vector<std::pair<std::pair<std::string, int>, int>> request_queue;
 std::mutex request_queue_mutex;
@@ -141,17 +144,65 @@ std::string getInfoHash (std::string input)
     std::stringstream oss;
     for (auto& c : info_dict_hash)
         oss << std::setw(2) << std::setfill('0') << std::hex << (int)c;
+    hash_hex=oss.str();
     return oss.str();
 }
-std::string peerList (std::string path)
+void initializeTorrentInfo (std::string path)
+{
+    FILE *f;
+    if (f=fopen(path.c_str(), "r"))
+    {
+        std::string input = extractTorrentInfo(f);
+        std::string hsh = getInfoHash(input);
+        decoded_value=decodeAll(input);
+        announce_url=decoded_value["announce"].dump().substr(1, (int)decoded_value["announce"].dump().size()-2);
+        total_size=decoded_value["info"]["length"].get<int>();
+    }
+    else
+        std::cerr << "Can't open path: " << path << "\n";
+}
+void initializeTorrentInfoMagnet (std::string input)
+{
+    int pos=0;
+    std::string tr_link="";
+    while (pos<input.size())
+    {
+        std::string nxt = getNextWord(input, pos, ":&=");
+        if (nxt=="btih")
+            hash_hex=getNextWord(input, pos, ":=&");
+        else if (nxt=="tr")
+            tr_link=getNextWord(input, pos, "=&");
+    }
+    std::string tr_link_un="";
+    for (int i=0;i<tr_link.size();i++)
+    {
+        if (i+2<tr_link.size() && tr_link[i]=='%' && tr_link[i+1]=='2' && tr_link[i+2]=='F')
+        {
+            tr_link_un.append(1, '/');
+            i+=2;
+        }
+        else if (i+2<tr_link.size() && tr_link[i]=='%' && tr_link[i+1]=='3' && tr_link[i+2]=='A')
+        {
+            tr_link_un.append(1, ':');
+            i+=2;
+        }
+        else
+            tr_link_un.append(1, tr_link[i]);
+    }
+    auto toInt = [&] (const char& x)
+    {
+        if (isdigit(x))
+            return x-'0';
+        return 10+x-'a';
+    };
+    for (int i=0;i<SHA_DIGEST_LENGTH;i++)
+        info_dict_hash[i]=(1 << 4)*toInt(hash_hex[i << 1])+toInt(hash_hex[i << 1 | 1]);
+    announce_url=tr_link_un;
+}
+std::string peerList ()
 {
     std::string ret="";
-    FILE *f;
-        if (f=fopen (path.c_str(), "r"))
-        {
-            std::string input = extractTorrentInfo(f);
-            decoded_value=decodeAll(input);
-            std::string reversed_url=decoded_value["announce"].dump().substr(1, (int)decoded_value["announce"].dump().size()-2), ip_str;
+            std::string reversed_url=announce_url, ip_str;
             std::reverse(reversed_url.begin(), reversed_url.end());
             int pos=0;
             std::string path = getNextWord(reversed_url, pos, "/");
@@ -182,6 +233,7 @@ std::string peerList (std::string path)
                 int stat = getaddrinfo(hostname.c_str(), "80", &hints, &result);
                 if (stat != 0)
                 {
+                    std::cerr << stat << " " << hostname.c_str() << "\n";
                     std::cerr << gai_strerror(stat) << "\n";
                     _exit (1);
                 }
@@ -203,11 +255,10 @@ std::string peerList (std::string path)
             path+='/';
             std::reverse (path.begin(), path.end());
             int pos3=0;
-            std::string hash_hex=getInfoHash(input);
             std::string hash="";
             for (int i=0;i<hash_hex.size()-1;i+=2)
                 hash.append(1, '%'), hash.append(1, hash_hex[i]), hash.append(1, hash_hex[i+1]);
-            std::string header="GET "+path+"?info_hash="+hash+"&peer_id="+"67676767676767676767&port=6881&uploaded=0&downloaded=0&left="+decoded_value["info"]["length"].dump()+"&compact=1 "+"HTTP/1.1\r\nHost: "+ip_str+"\r\nUser-Agent: BitTorrent-Peer\r\nAccept: */*\r\n";
+            std::string header="GET "+path+"?info_hash="+hash+"&peer_id="+"67676767676767676767&port=6881&uploaded=0&downloaded=0&left="+std::to_string(total_size==-1?6767:total_size)+"&compact=1 "+"HTTP/1.1\r\nHost: "+ip_str+"\r\nUser-Agent: BitTorrent-Peer\r\nAccept: */*\r\n";
             std::string body="\r\n";
             int pos2=0;
             if (connect (tracker_fd, (struct sockaddr*)&tracker, sizeof(tracker))>=0)
@@ -244,12 +295,9 @@ std::string peerList (std::string path)
             }
             else
                 std::cerr << "Connection to tracker failed!\n";
-        }
-        else
-            std::cerr << "Can't open info file\n";
     return ret;
 }
-std::pair <int, std::string> peerHandshake (std::string socket_str, std::string path)
+std::pair <int, std::string> peerHandshake (std::string socket_str, std::vector<int> extensions)
 {
     std::pair <int, std::string> ret;
     int pos=0;
@@ -267,27 +315,25 @@ std::pair <int, std::string> peerHandshake (std::string socket_str, std::string 
     FILE *f;
     if (connect (peer_fd, (struct sockaddr*)&peer, sizeof(peer))>=0)
     {
-        if (f=fopen(path.c_str(), "r"))
-        {
-            std::string input = extractTorrentInfo(f);
-            std::string hash_hex = getInfoHash(input);
             std::string wr;
             wr.append(1, 0b00010011);
             wr.append("BitTorrent protocol");
-            wr.append(8, 0b00000000);
+            wr.append(8, 0x00);
+            for (const auto& bit : extensions)
+            {
+                int pos=bit/8;
+                wr[27-pos] |=(1 << (bit%8));
+            }
             wr.append(std::string(reinterpret_cast<const char*>(info_dict_hash)));
             for (int i=1;i<=20;i++)
                 wr.append(1, rand()%257);
-            write (peer_fd, wr.c_str(), wr.size());
+            ssize_t m=write (peer_fd, wr.c_str(), wr.size());
             char buff[4096];
             ssize_t n=read(peer_fd, buff, sizeof(buff));
             std::stringstream oss;
             for (int i=n-20;i<n;i++)
                 oss << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)buff[i];
             ret.second=oss.str();
-        }
-        else
-            std::cerr << "Can't open info file\n";
     }
     else
         std::cerr << "Can't connect to peer\n";
@@ -317,9 +363,9 @@ std::string getPeerMessage (int fd)
     }
     return ret;
 }
-void worker (std::string socket_str, std::string path)
+void worker (std::string socket_str)
 {
-    auto [socket_fd, peer_id]=peerHandshake(socket_str, path);
+    auto [socket_fd, peer_id]=peerHandshake(socket_str, {});
     std::string msg=getPeerMessage(socket_fd);
     std::string wr="";
     wr.append(5, 0x00);
@@ -450,7 +496,8 @@ void downloadPiece (int piece_id)
         }
     }
 }
-int main(int argc, char* argv[]) {
+int main(int argc, char* argv[])
+{
     // Flush after every std::cout / std::cerr
     std::cout << std::unitbuf;
     std::cerr << std::unitbuf;
@@ -461,7 +508,22 @@ int main(int argc, char* argv[]) {
     }
 
     std::string command = argv[1];
-
+    auto getSockets = [&] (std::string peer_list)
+    {
+        std::vector<std::string> sockets;
+        int pos=0;
+        while (pos<peer_list.size())
+        {
+            std::string ip=getNextWord(peer_list, pos, ":");
+            int port=0;
+            ++pos;
+            for (int i=pos;i<pos+5;i++)
+                port=port*10+peer_list[i]-'0';
+            pos=pos+5;
+            sockets.push_back(ip+":"+std::to_string(port));
+        }
+        return sockets;
+    };
     if (command == "decode") {
         if (argc < 3) {
             std::cerr << "Usage: " << argv[0] << " decode <encoded_value>" << std::endl;
@@ -494,31 +556,23 @@ int main(int argc, char* argv[]) {
     }
     else if (command == "peers")
     {
-        std::cout << peerList(argv[2]) << "\n";
+        initializeTorrentInfo(argv[2]);
+        std::cout << peerList() << "\n";
     }
     else if (command == "handshake")
     {
+        initializeTorrentInfo(argv[2]);
         std::cout << "Peer ID: ";
-        std::cout << peerHandshake(argv[3], argv[2]).second << "\n";
+        std::cout << peerHandshake(argv[3], {}).second << "\n";
     }
     else if (command == "download_piece" || command == "download")
     {
-        std::string peer_list=peerList(argv[4]);
-        std::vector<std::string> sockets;
-        int pos=0;
-        while (pos<peer_list.size())
-        {
-            std::string ip=getNextWord(peer_list, pos, ":");
-            int port=0;
-            ++pos;
-            for (int i=pos;i<pos+5;i++)
-                port=port*10+peer_list[i]-'0';
-            pos=pos+5;
-            sockets.push_back(ip+":"+std::to_string(port));
-        }
+        initializeTorrentInfo(argv[4]);
+        std::string peer_list=peerList();
+        auto sockets=getSockets(peer_list);
         for (const auto& socket : sockets)
         {
-            std::thread th(worker, socket, argv[4]);
+            std::thread th(worker, socket);
             th.detach();
         }
         std::ofstream g (argv[3], std::ios::binary);
@@ -546,34 +600,15 @@ int main(int argc, char* argv[]) {
     }
     else if (command == "magnet_parse")
     {
-        std::string input = argv[2];
-        int pos=0;
-        std::string hsh="", tr_link="";
-        while (pos<input.size())
-        {
-            std::string nxt = getNextWord(input, pos, ":&=");
-            if (nxt=="btih")
-                hsh=getNextWord(input, pos, ":&=");
-            else if (nxt=="tr")
-                tr_link=getNextWord(input, pos, ":&=");
-        }
-        std::string tr_link_un="";
-        for (int i=0;i<tr_link.size();i++)
-        {
-            if (i+2<tr_link.size() && tr_link[i]=='%' && tr_link[i+1]=='2' && tr_link[i+2]=='F')
-            {
-                tr_link_un.append(1, '/');
-                i+=2;
-            }
-            else if (i+2<tr_link.size() && tr_link[i]=='%' && tr_link[i+1]=='3' && tr_link[i+2]=='A')
-            {
-                tr_link_un.append(1, ':');
-                i+=2;
-            }
-            else
-                tr_link_un.append(1, tr_link[i]);
-        }
-        std::cout << "Tracker URL: " << tr_link_un << "\nInfo Hash: " << hsh << "\n";
+        initializeTorrentInfoMagnet(argv[2]);
+        std::cout << "Tracker URL: " << announce_url << "\nInfo Hash: " << hash_hex << "\n";
+    }
+    else if (command == "magnet_handshake")
+    {
+        initializeTorrentInfoMagnet(argv[2]);
+        std::string peer_list=peerList();
+        auto sockets = getSockets(peer_list);
+        std::cout << "Peer ID: " << peerHandshake(sockets[0], {20}).second << "\n";
     }
     else {
         std::cerr << "unknown command: " << command << std::endl;
