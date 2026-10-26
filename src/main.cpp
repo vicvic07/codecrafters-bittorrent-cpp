@@ -623,7 +623,6 @@ int main(int argc, char* argv[])
         int supports_all_extensions=ret.second.second;
         std::cerr << supports_all_extensions << "\n";
         char buff[4096];
-        ssize_t n=read (peer_fd, buff, sizeof(buff));
         std::string wr="";
         wr.append(4, 0x00);
         wr.append(1, 20);
@@ -636,8 +635,19 @@ int main(int argc, char* argv[])
                 wr[i] |=(sz & (1 << j));
         }
         if (supports_all_extensions)
+        {
             write (peer_fd, wr.c_str(), wr.size());
+            std::string recv_hand;
+            ssize_t n=read(peer_fd, buff, sizeof(buff));
+            for (int i=0;i<n;i++)
+                recv_hand.append(1, buff[i]);
+            for (const auto& ch : recv_hand)
+                std::cerr << std::hex << std::setw(2) << std::setfill('0') << (unsigned char)ch << " ";
+            std::cerr << "\n";
+            decoded_value = decodeAll(recv_hand.substr(12, (int)recv_hand.size()-12));
+        }
         std::cout << "Peer ID: " << peer_id << "\n";
+        std::cout << "Peer Metadata Extension ID: " << decoded_value["m"]["ut_metadata"].dump() << "\n";
     }
     else {
         std::cerr << "unknown command: " << command << std::endl;
